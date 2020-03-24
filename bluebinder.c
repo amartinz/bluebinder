@@ -39,10 +39,6 @@
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/hci.h>
 
-#if USE_SYSTEMD
-#include <systemd/sd-daemon.h>
-#endif
-
 #include <gbinder.h>
 
 #include <glib-unix.h>
@@ -577,12 +573,6 @@ unref:
     }
 
     close(proxy.host_fd);
-
-#if USE_SYSTEMD
-    sd_notify(0,
-        "STATUS=Exiting.\n"
-        "ERRNO=19");
-#endif
 
     return err;
 }

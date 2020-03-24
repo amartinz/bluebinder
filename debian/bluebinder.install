@@ -1,0 +1,2 @@
+bluebinder_*.sh usr/bin/droid
+upstart_bluebinder.conf etc/init/bluebinder.conf

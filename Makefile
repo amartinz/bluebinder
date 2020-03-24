@@ -2,10 +2,8 @@
 
 USE_SYSTEMD ?= 1
 
-DEPEND_LIBS = libgbinder glib-2.0
-ifeq ($(USE_SYSTEMD),1)
-DEPEND_LIBS += libsystemd
-endif
+build:
+	gcc -Wall -O3 -flto bluebinder.c `pkg-config --cflags libgbinder` `pkg-config --libs libgbinder` -o bluebinder
 
 build: bluebinder
 
@@ -17,5 +15,5 @@ install:
 	cp bluebinder $(DESTDIR)/usr/sbin
 
 clean:
-	rm bluebinder
+	if test -a "bluebinder"; then rm bluebinder; fi;
 
