@@ -3,7 +3,9 @@
 USE_SYSTEMD ?= 1
 
 build:
-	gcc -Wall -O3 -flto bluebinder.c `pkg-config --cflags libgbinder` `pkg-config --libs libgbinder` -o bluebinder
+	gcc -Wall -O3 -flto bluebinder.c \
+		`pkg-config --cflags glib-2.0` `pkg-config --libs glib-2.0` \
+		`pkg-config --cflags libgbinder` `pkg-config --libs libgbinder` -o bluebinder
 
 build: bluebinder
 
