@@ -7,11 +7,6 @@ build:
 		`pkg-config --cflags glib-2.0` `pkg-config --libs glib-2.0` \
 		`pkg-config --cflags libgbinder` `pkg-config --libs libgbinder` -o bluebinder
 
-build: bluebinder
-
-bluebinder: bluebinder.c
-	gcc $(CFLAGS) -Wall -flto $^ `pkg-config --cflags --libs $(DEPEND_LIBS)` -DUSE_SYSTEMD=$(USE_SYSTEMD) -o $@
-
 install:
 	mkdir -p $(DESTDIR)/usr/sbin
 	cp bluebinder $(DESTDIR)/usr/sbin

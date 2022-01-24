@@ -39,6 +39,8 @@
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/hci.h>
 
+#include <linux/rfkill.h>
+
 #include <gbinder.h>
 
 #include <glib-unix.h>
@@ -71,6 +73,15 @@ struct proxy {
 
     int binder_replies_pending;
     gboolean init_failed;
+
+    int own_hci_index;
+
+    int rfkill_fd;
+    GIOChannel *rfkill_channel;
+    int rfkill_watch_id;
+
+    gboolean bluetooth_on;
+    gboolean reset_sent;
 };
 
 void
@@ -161,9 +172,19 @@ dev_write_packet(
             &error);
 
         if (status == G_IO_STATUS_ERROR) {
-            fprintf(stderr, "Writing packet to device failed: %s\n", error->message);
-            // do not quit here, since this might happen if the user switches off
-            // bt but the hw still wants to send a final event.
+            fprintf(stderr, "Writing packet from HAL to vhci device failed: %s\n", !error ? "" : error->message);
+            // do not quit here, this might happen if we receive events after stopping bt.
+            // could this be related to HCI_QUIRK_RESET_ON_CLOSE?
+            if (!proxy->bluetooth_on && !proxy->reset_sent) {
+                uint8_t hci_reset[4];
+                hci_reset[0] = HCI_COMMAND_PKT;
+                hci_reset[1] = 0x03;
+                hci_reset[2] = 0x0c;
+                hci_reset[3] = 0;
+
+                host_write_packet(proxy, hci_reset, 4);
+                proxy->reset_sent = TRUE;
+            }
             return;
         }
 
@@ -348,26 +369,192 @@ binder_remote_died(
 
 static
 gboolean
+rfkill_callback(
+    GIOChannel *channel,
+    GIOCondition condition,
+    gpointer user_data)
+{
+    struct proxy *proxy = (struct proxy*)user_data;
+
+    if (condition & (G_IO_NVAL | G_IO_HUP | G_IO_ERR))
+        return FALSE;
+
+    if (condition & G_IO_IN) {
+        GIOStatus status;
+        struct rfkill_event event;
+        gsize read;
+
+        status = g_io_channel_read_chars(channel,
+                                          (char *) &event,
+                                          sizeof(event),
+                                          &read,
+                                          NULL);
+
+        while (status == G_IO_STATUS_NORMAL && read == sizeof(event)) {
+            if (event.type == RFKILL_TYPE_BLUETOOTH && event.idx == proxy->own_hci_index) {
+                if (event.soft || event.hard) {
+                    proxy->bluetooth_on = FALSE;
+                } else {
+                    proxy->bluetooth_on = TRUE;
+                    proxy->reset_sent = FALSE;
+                }
+            }
+
+            status = g_io_channel_read_chars(channel,
+                                              (char *) &event,
+                                              sizeof(event),
+                                              &read,
+                                              NULL);
+        }
+    } else {
+        fprintf(stderr, "!(condition & G_IO_IN)");
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static
+gboolean
 binder_init_complete(
     struct proxy* proxy)
 {
+    bool ret = FALSE;
+    GList *previous_devices = NULL;
+    int rfkill_fd = -1;
+
+    rfkill_fd = open("/dev/rfkill", O_RDONLY);
+    proxy->own_hci_index = -1;
+
     fprintf(stderr, "Binder interface initialized, opening virtual device\n");
+
+    if (rfkill_fd < 0) {
+        fprintf(stderr, "Failed to open /dev/rfkill %d: %s\n", errno, strerror(errno));
+        ret = FALSE;
+        goto exit;
+    }
+
+    fcntl(rfkill_fd, F_SETFL, O_NONBLOCK);
+
+    for (;;) {
+        struct rfkill_event event;
+        int len;
+
+        if ((len = read(rfkill_fd, &event, sizeof(event))) < 0) {
+            if (errno == EAGAIN) {
+                break;
+            } else {
+                fprintf(stderr, "Reading from rfkill failed\n");
+                ret = FALSE;
+                goto exit;
+            }
+        }
+
+        if (event.type == RFKILL_TYPE_BLUETOOTH) {
+            previous_devices = g_list_append(previous_devices, GINT_TO_POINTER(event.idx));
+        }
+    }
+
+    close(rfkill_fd);
 
     proxy->host_fd = open_vhci(HCI_PRIMARY);
     if (proxy->host_fd < 0) {
         fprintf(stderr, "Unable to open virtual device\n");
-        return FALSE;
+ret = FALSE;
+        goto exit;
     }
 
     if (!setup_watch(proxy)) {
         fprintf(stderr, "Unable to setup watch\n");
-        return FALSE;
+       ret = FALSE;
+        goto exit;
     }
 
+    rfkill_fd = open("/dev/rfkill", O_RDONLY);
+
+    if (rfkill_fd < 0) {
+        fprintf(stderr, "Failed to open /dev/rfkill %d: %s\n", errno, strerror(errno));
+        ret = FALSE;
+        goto exit;
+    }
+
+    fcntl(rfkill_fd, F_SETFL, O_NONBLOCK);
+
+    for (;;) {
+        struct rfkill_event event;
+        int len;
+
+        if ((len = read(rfkill_fd, &event, sizeof(event))) < 0) {
+            if (errno == EAGAIN) {
+                break;
+            } else {
+                fprintf(stderr, "Reading from rfkill failed\n");
+                ret = FALSE;
+                goto exit;
+            }
+        }
+
+        if (event.type == RFKILL_TYPE_BLUETOOTH && !g_list_find(previous_devices, GINT_TO_POINTER(event.idx))) {
+            if (proxy->own_hci_index == -1) {
+                proxy->own_hci_index = event.idx;
+            } else {
+                fprintf(stderr, "Found multiple new hci devices, couldn't determine own hci index for rfkill handling.");
+                ret = FALSE;
+                goto exit;
+            }
+        }
+    }
+
+    if (proxy->own_hci_index >= 0) {
+        fprintf(stderr, "Own hci index: %d\n", proxy->own_hci_index);
+        ret = TRUE;
+    } else {
+        fprintf(stderr, "Could not find own hci index\n");
+    }
+
+    proxy->rfkill_fd = open("/dev/rfkill", O_RDONLY);
+    proxy->rfkill_channel = g_io_channel_unix_new(proxy->rfkill_fd);
+    g_io_channel_set_encoding(proxy->rfkill_channel, NULL, NULL);
+    g_io_channel_set_buffered(proxy->rfkill_channel, FALSE);
+
+    fcntl(proxy->rfkill_fd, F_SETFL, O_NONBLOCK);
+
+    for (;;) {
+        struct rfkill_event event;
+        int len;
+
+        if ((len = read(proxy->rfkill_fd, &event, sizeof(event))) < 0) {
+            if (errno == EAGAIN) {
+                break;
+            } else {
+                fprintf(stderr, "Reading from rfkill failed\n");
+                return 1;
+            }
+        }
+
+        if (event.type == RFKILL_TYPE_BLUETOOTH && event.idx == proxy->own_hci_index) {
+            if (event.soft || event.hard) {
+                proxy->bluetooth_on = FALSE;
+            } else {
+                proxy->bluetooth_on = TRUE;
+            }
+        }
+    }
+
+proxy->rfkill_watch_id = g_io_add_watch_full(proxy->rfkill_channel,
+                                G_PRIORITY_DEFAULT_IDLE - 1,
+                                (GIOCondition)(G_IO_IN | G_IO_HUP | G_IO_ERR),
+                                (GIOFunc)rfkill_callback, (gpointer)proxy,
+                                NULL);
+    g_io_channel_set_flags(proxy->rfkill_channel, G_IO_FLAG_NONBLOCK, NULL);
+
+exit:
     if (proxy->init_failed && proxy->loop)
         g_main_loop_quit(proxy->loop);
 
-    return TRUE;
+   g_list_free(previous_devices);
+    if (rfkill_fd >= 0) close(rfkill_fd);
+    return ret;
 }
 
 static
@@ -439,7 +626,11 @@ bluebinder_callbacks_transact(
                         (code == 3) ? HCI_ACLDATA_PKT :
                         (code == 4) ? HCI_SCODATA_PKT : /* unreachable */ 0xFF;
 
-            dev_write_packet(proxy, packet, count + 1);
+            if (proxy->channel) {
+                dev_write_packet(proxy, packet, count + 1);
+            } else {
+                fprintf(stderr, "Received packet before bluetooth was up.\n");
+            }
 
             free(packet);
 
