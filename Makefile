@@ -1,6 +1,6 @@
 # TODO: this is a bit minimalistic isn't it?
 
-USE_SYSTEMD ?= 1
+USE_SYSTEMD ?= 0
 
 DEPEND_LIBS = glib-2.0 libgbinder
 ifeq ($(USE_SYSTEMD),1)
